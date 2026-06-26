@@ -15,6 +15,7 @@ app.use((req, res, next) => {
 
 // The compile page is served inline (no separate file needed).
 const COMPILE_HTML = `<!doctype html><html><head><meta charset="utf-8">
+<script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-aframe.prod.js"></script>
 </head><body><script>
 function loadImg(u){return new Promise((res,rej)=>{const im=new Image();im.crossOrigin="anonymous";im.onload=()=>res(im);im.onerror=()=>rej(new Error("img load "+u));im.src=u;});}
@@ -26,19 +27,24 @@ function downscale(im,max){return new Promise(res=>{let w=im.naturalWidth,h=im.n
     const AUTH = { apikey: KEY, Authorization: "Bearer " + KEY };
     for (let i=0; i<200 && !(window.MINDAR && window.MINDAR.IMAGE && window.MINDAR.IMAGE.Compiler); i++){ await new Promise(r=>setTimeout(r,250)); }
     if (!(window.MINDAR && window.MINDAR.IMAGE && window.MINDAR.IMAGE.Compiler)) throw new Error("MindAR compiler not available");
+    console.log("[c] compiler ready, aframe=" + (typeof window.AFRAME));
     const rows = await (await fetch(SUPA + "/rest/v1/markers?select=marker_url&order=created_at.asc", { headers: AUTH })).json();
     if (!Array.isArray(rows) || rows.length === 0){ window.__info={targets:0, note:"no markers"}; window.__done=true; return; }
+    console.log("[c] markers=" + rows.length);
     let imgs = await Promise.all(rows.map(r => loadImg(r.marker_url)));
     imgs = await Promise.all(imgs.map(i => downscale(i, 384)));
+    console.log("[c] images ready, compiling " + imgs.length + " @ " + imgs.map(i=>i.naturalWidth+"x"+i.naturalHeight).join(","));
     const compiler = new window.MINDAR.IMAGE.Compiler();
-    await compiler.compileImageTargets(imgs, ()=>{});
+    await compiler.compileImageTargets(imgs, (p)=>{ if(Math.round(p*100)%20===0) console.log("[c] progress " + Math.round(p*100) + "%"); });
+    console.log("[c] compiled, exporting");
     const buf = compiler.exportData();
+    console.log("[c] exported bytes=" + buf.byteLength);
     await fetch(SUPA + "/storage/v1/object/ar/library.mind", { method:"DELETE", headers: AUTH }).catch(()=>{});
     const up = await fetch(SUPA + "/storage/v1/object/ar/library.mind", { method:"POST", headers: { ...AUTH, "x-upsert":"true", "Content-Type":"application/octet-stream" }, body: buf });
     if (up.status >= 300) throw new Error("upload status " + up.status);
     window.__info = { targets: imgs.length, bytes: buf.byteLength, upload: up.status };
     window.__done = true;
-  } catch (e) { window.__err = String((e && e.message) || e); }
+  } catch (e) { window.__err = String((e && e.message) || e); console.log("[c] ERROR " + window.__err); }
 })();
 </script></body></html>`;
 
@@ -50,7 +56,9 @@ function getBrowser() {
     browserPromise = puppeteer.launch({
       headless: "new",
       protocolTimeout: 600000, // 10 min — don't time out mid-compile
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+             "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
+             "--disable-backgrounding-occluded-windows"],
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     });
   }
@@ -67,6 +75,8 @@ app.get("/rebuild", async (req, res) => {
   try {
     const browser = await getBrowser();
     page = await browser.newPage();
+    page.on("console", (m) => console.log("[page] " + m.text()));
+    page.on("pageerror", (e) => console.log("[pageerror] " + e.message));
     await page.evaluateOnNewDocument((cfg) => { window.__CFG = cfg; }, { supa: SUPA, key: KEY });
     await page.goto(`http://localhost:${PORT}/compile.html`, { waitUntil: "load", timeout: 60000 });
     await page.waitForFunction("window.__done === true || !!window.__err", { timeout: 540000, polling: 500 });
