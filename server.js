@@ -1,6 +1,5 @@
 const express = require("express");
 const puppeteer = require("puppeteer");
-const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -8,20 +7,50 @@ const SECRET = process.env.REBUILD_SECRET || "changeme";
 const SUPA = process.env.SUPABASE_URL || "";
 const KEY = process.env.SUPABASE_ANON_KEY || "";
 
-// allow the Studio (any origin) to call /rebuild
 app.use((req, res, next) => {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Headers", "*");
   next();
 });
-app.use(express.static(path.join(__dirname, "public")));
+
+// The compile page is served inline (no separate file needed).
+const COMPILE_HTML = `<!doctype html><html><head><meta charset="utf-8">
+<script src="https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-aframe.prod.js"></script>
+</head><body><script>
+function loadImg(u){return new Promise((res,rej)=>{const im=new Image();im.crossOrigin="anonymous";im.onload=()=>res(im);im.onerror=()=>rej(new Error("img load "+u));im.src=u;});}
+function downscale(im,max){return new Promise(res=>{let w=im.naturalWidth,h=im.naturalHeight;if(Math.max(w,h)<=max){res(im);return;}let s=max/Math.max(w,h);let c=document.createElement("canvas");c.width=Math.round(w*s);c.height=Math.round(h*s);c.getContext("2d").drawImage(im,0,0,c.width,c.height);let o=new Image();o.onload=()=>res(o);o.src=c.toDataURL("image/jpeg",0.9);});}
+(async()=>{
+  try{
+    const CFG = window.__CFG || {};
+    const SUPA = CFG.supa, KEY = CFG.key;
+    const AUTH = { apikey: KEY, Authorization: "Bearer " + KEY };
+    for (let i=0; i<200 && !(window.MINDAR && window.MINDAR.IMAGE && window.MINDAR.IMAGE.Compiler); i++){ await new Promise(r=>setTimeout(r,250)); }
+    if (!(window.MINDAR && window.MINDAR.IMAGE && window.MINDAR.IMAGE.Compiler)) throw new Error("MindAR compiler not available");
+    const rows = await (await fetch(SUPA + "/rest/v1/markers?select=marker_url&order=created_at.asc", { headers: AUTH })).json();
+    if (!Array.isArray(rows) || rows.length === 0){ window.__info={targets:0, note:"no markers"}; window.__done=true; return; }
+    let imgs = await Promise.all(rows.map(r => loadImg(r.marker_url)));
+    imgs = await Promise.all(imgs.map(i => downscale(i, 384)));
+    const compiler = new window.MINDAR.IMAGE.Compiler();
+    await compiler.compileImageTargets(imgs, ()=>{});
+    const buf = compiler.exportData();
+    await fetch(SUPA + "/storage/v1/object/ar/library.mind", { method:"DELETE", headers: AUTH }).catch(()=>{});
+    const up = await fetch(SUPA + "/storage/v1/object/ar/library.mind", { method:"POST", headers: { ...AUTH, "x-upsert":"true", "Content-Type":"application/octet-stream" }, body: buf });
+    if (up.status >= 300) throw new Error("upload status " + up.status);
+    window.__info = { targets: imgs.length, bytes: buf.byteLength, upload: up.status };
+    window.__done = true;
+  } catch (e) { window.__err = String((e && e.message) || e); }
+})();
+</script></body></html>`;
+
+app.get("/compile.html", (req, res) => { res.type("html").send(COMPILE_HTML); });
 
 let browserPromise = null;
 function getBrowser() {
   if (!browserPromise) {
     browserPromise = puppeteer.launch({
       headless: "new",
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+      protocolTimeout: 600000, // 10 min — don't time out mid-compile
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     });
   }
@@ -30,11 +59,9 @@ function getBrowser() {
 
 app.get("/health", (req, res) => res.send("ok"));
 
-// Rebuild the recognition library from all markers in Supabase.
 app.get("/rebuild", async (req, res) => {
   if (req.query.token !== SECRET) return res.status(401).json({ error: "bad token" });
   if (!SUPA || !KEY) return res.status(500).json({ error: "SUPABASE_URL / SUPABASE_ANON_KEY not set" });
-
   let page;
   const started = Date.now();
   try {
@@ -42,7 +69,7 @@ app.get("/rebuild", async (req, res) => {
     page = await browser.newPage();
     await page.evaluateOnNewDocument((cfg) => { window.__CFG = cfg; }, { supa: SUPA, key: KEY });
     await page.goto(`http://localhost:${PORT}/compile.html`, { waitUntil: "load", timeout: 60000 });
-    await page.waitForFunction("window.__done === true || !!window.__err", { timeout: 240000, polling: 500 });
+    await page.waitForFunction("window.__done === true || !!window.__err", { timeout: 540000, polling: 500 });
     const out = await page.evaluate(() => ({ done: window.__done, err: window.__err, info: window.__info }));
     if (out.err) return res.status(500).json({ error: out.err, seconds: ((Date.now() - started) / 1000) | 0 });
     res.json({ ok: true, info: out.info, seconds: ((Date.now() - started) / 1000) | 0 });
