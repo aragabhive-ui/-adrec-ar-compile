@@ -58,7 +58,10 @@ function getBrowser() {
       protocolTimeout: 600000, // 10 min — don't time out mid-compile
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
              "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
-             "--disable-backgrounding-occluded-windows"],
+             "--disable-backgrounding-occluded-windows",
+             // give headless Chrome software WebGL (SwiftShader) — MindAR/TF.js needs it
+             "--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
+             "--enable-webgl", "--ignore-gpu-blocklist"],
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     });
   }
