@@ -7,9 +7,17 @@ const SECRET = process.env.REBUILD_SECRET || "changeme";
 const SUPA = process.env.SUPABASE_URL || "";
 const KEY = process.env.SUPABASE_ANON_KEY || "";
 
+// --- AI "Ask the report" config (additive; does not affect compile routes) ---
+const ANTHROPIC_KEY   = process.env.ANTHROPIC_API_KEY || "";          // set at deploy time, never in code
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL   || "claude-haiku-4-5-20251001";
+const KB_URL          = process.env.KB_URL || "https://adrec-ar.web.app/report-knowledge.json";
+
+app.use(express.json({ limit: "1mb" }));
 app.use((req, res, next) => {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Headers", "*");
+  res.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
 
@@ -115,6 +123,67 @@ app.get("/compile-one", (req, res) => {
   if (!SUPA || !KEY) return res.status(500).json({ error: "SUPABASE_URL / SUPABASE_ANON_KEY not set" });
   if (!req.query.img) return res.status(400).json({ error: "missing img" });
   runCompile(res, { supa: SUPA, key: KEY, singleImg: req.query.img, outName: req.query.out || "single.mind" });
+});
+
+// ===================== AI: "Ask the report" =====================
+// POST /ask  { question: "..." }  -> { answer, citations:[pages] }
+// Grounded ONLY on report-knowledge.json. Key lives in ANTHROPIC_API_KEY env var.
+let KB_CACHE = null, KB_AT = 0;
+async function getKB() {
+  if (KB_CACHE && (Date.now() - KB_AT) < 3600000) return KB_CACHE;
+  const r = await fetch(KB_URL, { cache: "no-store" });
+  if (!r.ok) throw new Error("KB fetch " + r.status);
+  KB_CACHE = await r.text(); KB_AT = Date.now();
+  return KB_CACHE;
+}
+
+function systemPrompt(kb) {
+  return [
+    "You are the ADREC Report Assistant, embedded in an augmented-reality experience for the Abu Dhabi Real Estate Centre (ADREC) 2025 Market Report.",
+    "You answer questions about THIS report only, using ONLY the verified data in the JSON knowledge base below.",
+    "",
+    "RULES (strict):",
+    "1) Use ONLY facts present in the knowledge base. NEVER invent, estimate, or extrapolate a number. If a figure isn't there, say it isn't in the report.",
+    "2) SCOPE: the report covers Abu Dhabi Emirate in 2025 only. If asked about other emirates (e.g. Dubai), other years, or topics outside the report, say it's outside this report and offer what the report does cover.",
+    "3) NO ADVICE: never give personalized investment, financial, or legal advice, or a buy/sell/hold recommendation. Share the report's facts, then add one short sentence that this is information from the report, not advice.",
+    "4) ALWAYS cite the report page number(s) you used, like (p.46).",
+    "5) Keep answers short and conversational — 1-4 sentences, suitable for a phone screen. Use AED for money.",
+    "6) INTENT QUESTIONS: for open or judgement-style questions (e.g. 'where should I invest', 'what are the hot areas', 'best place to buy', 'is it a good time'), do NOT recommend. Interpret the intent and SYNTHESISE the report's relevant standouts — top districts by price, price growth, FDI and expat demand, off-plan activity, supply and rents — combining facts across sections, and present them as what the report highlights, ending with the not-advice caveat.",
+    "7) Be genuinely helpful and conversational: understand paraphrases and follow-ups, connect related figures, and reason over the data — but never go beyond what the knowledge base contains.",
+    "",
+    "KNOWLEDGE BASE (JSON):",
+    kb
+  ].join("\n");
+}
+
+app.post("/ask", async (req, res) => {
+  try {
+    const question = (req.body && req.body.question || "").toString().slice(0, 600).trim();
+    if (!question) return res.status(400).json({ error: "missing question" });
+    if (!ANTHROPIC_KEY) return res.status(503).json({ error: "AI not configured", hint: "set ANTHROPIC_API_KEY" });
+    const kb = await getKB();
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: ANTHROPIC_MODEL,
+        max_tokens: 650,
+        system: systemPrompt(kb),
+        messages: [{ role: "user", content: question }]
+      })
+    });
+    const data = await r.json();
+    if (!r.ok) return res.status(502).json({ error: (data && data.error && data.error.message) || ("AI status " + r.status) });
+    const answer = (data.content || []).map(b => b.text || "").join("").trim();
+    const citations = (answer.match(/p\.?\s?(\d{1,3})/gi) || []).map(s => s.replace(/[^\d]/g, ""));
+    res.json({ answer, citations: [...new Set(citations)] });
+  } catch (e) {
+    res.status(500).json({ error: String((e && e.message) || e) });
+  }
 });
 
 app.listen(PORT, () => console.log("ADREC AR compile service listening on " + PORT));
